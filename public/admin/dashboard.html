@@ -83,7 +83,7 @@
       formData.append("qr", qr);
 
       try {
-        const res = await fetch("http://localhost:3000/admin/add-method", {
+        const res = await fetch("https://harvestive-co-backend.onrender.com/admin/add-method", {
           method: "POST",
           body: formData
         });
@@ -102,7 +102,7 @@
 
     async function loadMethods() {
       try {
-        const res = await fetch("http://localhost:3000/admin/methods");
+        const res = await fetch("https://harvestive-co-backend.onrender.com/admin/methods");
         const data = await res.json();
         if (!res.ok) return alert("Error loading methods");
 
@@ -122,7 +122,7 @@
 
     async function loadWithdrawals() {
       try {
-        const res = await fetch("http://localhost:3000/admin/withdrawals");
+        const res = await fetch("https://harvestive-co-backend.onrender.com/admin/withdrawals");
         const data = await res.json();
         if (!res.ok) return alert("Error loading withdrawals");
 
@@ -151,7 +151,7 @@
 
     async function approveWithdraw(id) {
       try {
-        const res = await fetch(`http://localhost:3000/admin/withdraw/${id}/approve`, { method: "POST" });
+        const res = await fetch(`https://harvestive-co-backend.onrender.com/admin/withdraw/${id}/approve`, { method: "POST" });
         const data = await res.json();
         if (res.ok) {
           alert("✅ Withdrawal approved");
@@ -166,7 +166,7 @@
 
     async function rejectWithdraw(id) {
       try {
-        const res = await fetch(`http://localhost:3000/admin/withdraw/${id}/reject`, { method: "POST" });
+        const res = await fetch(`https://harvestive-co-backend.onrender.com/admin/withdraw/${id}/reject`, { method: "POST" });
         const data = await res.json();
         if (res.ok) {
           alert("❌ Withdrawal rejected");
