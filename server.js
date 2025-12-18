@@ -35,6 +35,11 @@ async function connectDB() {
     depositMethods = db.collection("deposit_methods");
     withdrawMethods = db.collection("withdraw_methods");
     console.log("✅ Connected to MongoDB Atlas!");
+    
+    // Create indexes for better performance
+    await depositMethods.createIndex({ enabled: 1 });
+    await withdrawMethods.createIndex({ enabled: 1 });
+    
   } catch (err) {
     console.error("❌ MongoDB connection error:", err);
     process.exit(1);
@@ -438,24 +443,258 @@ app.get("/user/dashboard", auth, async (req, res) => {
   }
 });
 
+// ====== DEPOSIT METHODS ======
+// GET deposit methods (public endpoint - no auth required)
+app.get("/user/deposit-methods", async (req, res) => {
+  try {
+    const methods = await depositMethods.find({ enabled: true }).toArray();
+    
+    // If no methods exist, create default ones
+    if (methods.length === 0) {
+      const defaultMethods = [
+        {
+          _id: new ObjectId(),
+          name: "Bitcoin (BTC)",
+          address: "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+          qr: "https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+          enabled: true,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        },
+        {
+          _id: new ObjectId(),
+          name: "USDT (TRC20)",
+          address: "TQzrAtZKcgEGeJTDPB6uUCg8jSxWTCEPyM",
+          qr: "https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=TQzrAtZKcgEGeJTDPB6uUCg8jSxWTCEPyM",
+          enabled: true,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        },
+        {
+          _id: new ObjectId(),
+          name: "Ethereum (ETH)",
+          address: "0x742d35Cc6634C0532925a3b844Bc9e0FF6e3eF53",
+          qr: "https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=0x742d35Cc6634C0532925a3b844Bc9e0FF6e3eF53",
+          enabled: true,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        }
+      ];
+      
+      // Insert default methods
+      await depositMethods.insertMany(defaultMethods);
+      res.json(defaultMethods);
+    } else {
+      res.json(methods);
+    }
+  } catch (err) {
+    console.error("Error fetching deposit methods:", err);
+    res.status(500).json({ error: "Error fetching deposit methods" });
+  }
+});
+
+// ADMIN: GET all deposit methods
+app.get("/admin/deposit-methods", auth, requireAdmin, async (req, res) => {
+  try {
+    const methods = await depositMethods.find().sort({ createdAt: -1 }).toArray();
+    res.json(methods);
+  } catch (err) {
+    console.error("Error fetching deposit methods:", err);
+    res.status(500).json({ error: "Error fetching deposit methods" });
+  }
+});
+
+// ADMIN: ADD new deposit method
+app.post("/admin/deposit-methods", auth, requireAdmin, upload.single("qr"), async (req, res) => {
+  try {
+    const { name, address } = req.body;
+    
+    if (!name || !address) {
+      return res.status(400).json({ error: "Name and address are required" });
+    }
+
+    // Convert image to base64 if uploaded
+    let qrData = null;
+    if (req.file) {
+      qrData = `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}`;
+    } else {
+      // Generate QR code URL if no image provided
+      qrData = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(address)}`;
+    }
+
+    const method = {
+      name,
+      address,
+      qr: qrData,
+      enabled: true,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const result = await depositMethods.insertOne(method);
+    
+    res.json({ 
+      success: true,
+      message: "✅ Deposit method added successfully",
+      methodId: result.insertedId,
+      method: method
+    });
+
+  } catch (err) {
+    console.error("Error adding deposit method:", err);
+    res.status(500).json({ error: "Error adding deposit method" });
+  }
+});
+
+// ADMIN: DELETE deposit method
+app.delete("/admin/deposit-methods/:id", auth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const result = await depositMethods.deleteOne({ _id: new ObjectId(id) });
+    
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: "Method not found" });
+    }
+    
+    res.json({ 
+      success: true,
+      message: "✅ Deposit method deleted successfully",
+      deletedId: id
+    });
+
+  } catch (err) {
+    console.error("Error deleting deposit method:", err);
+    res.status(500).json({ error: "Error deleting deposit method" });
+  }
+});
+
+// ADMIN: TOGGLE deposit method status
+app.put("/admin/deposit-methods/:id/toggle", auth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const method = await depositMethods.findOne({ _id: new ObjectId(id) });
+    
+    if (!method) {
+      return res.status(404).json({ error: "Method not found" });
+    }
+    
+    const newStatus = !method.enabled;
+    await depositMethods.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { enabled: newStatus, updatedAt: new Date() } }
+    );
+    
+    res.json({ 
+      success: true,
+      message: `✅ Method ${newStatus ? 'enabled' : 'disabled'} successfully`,
+      methodId: id,
+      enabled: newStatus
+    });
+
+  } catch (err) {
+    console.error("Error toggling deposit method:", err);
+    res.status(500).json({ error: "Error toggling deposit method" });
+  }
+});
+
+// ====== WITHDRAW METHODS ======
+// GET withdraw methods (public endpoint)
+app.get("/user/withdraw-methods", async (req, res) => {
+  try {
+    const methods = await withdrawMethods.find({ enabled: true }).toArray();
+    
+    // If no methods exist, create default ones
+    if (methods.length === 0) {
+      const defaultMethods = [
+        {
+          _id: new ObjectId(),
+          name: "Bitcoin (BTC)",
+          min: 20000,
+          fee: 0.001,
+          enabled: true,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        },
+        {
+          _id: new ObjectId(),
+          name: "USDT (TRC20)",
+          min: 20000,
+          fee: 1,
+          enabled: true,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        },
+        {
+          _id: new ObjectId(),
+          name: "Bank Transfer",
+          min: 20000,
+          fee: 0,
+          enabled: true,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        }
+      ];
+      
+      await withdrawMethods.insertMany(defaultMethods);
+      res.json(defaultMethods);
+    } else {
+      res.json(methods);
+    }
+  } catch (err) {
+    console.error("Error fetching withdraw methods:", err);
+    res.status(500).json({ error: "Error fetching withdraw methods" });
+  }
+});
+
 // ====== DEPOSIT ======
 app.post("/deposit", auth, upload.single("screenshot"), async (req, res) => {
   try {
     const { amount, method } = req.body;
     const numericAmount = parseFloat(amount);
-    if (!amount || !method || isNaN(numericAmount)) return res.status(400).json({ error: "Invalid fields" });
+    
+    if (!amount || !method || isNaN(numericAmount)) {
+      return res.status(400).json({ error: "Invalid fields" });
+    }
+
+    // Validate minimum deposit
+    if (numericAmount < 100) {
+      return res.status(400).json({ error: "Minimum deposit is $100" });
+    }
+
+    // Verify the method exists
+    const methodExists = await depositMethods.findOne({ 
+      _id: new ObjectId(method), 
+      enabled: true 
+    });
+    
+    if (!methodExists) {
+      return res.status(400).json({ error: "Invalid deposit method" });
+    }
 
     const deposit = {
       userId: req.userId,
       amount: numericAmount,
-      method,
-      screenshot: req.file ? req.file.buffer.toString("base64") : null,
+      method: methodExists.name,
+      methodId: method,
+      address: methodExists.address,
+      screenshot: req.file ? `data:${req.file.mimetype};base64,${req.file.buffer.toString("base64")}` : null,
       status: "pending",
       createdAt: new Date(),
     };
 
     const r = await deposits.insertOne(deposit);
-    res.json({ message: "✅ Deposit submitted", id: r.insertedId.toString() });
+    
+    res.json({ 
+      success: true,
+      message: "✅ Deposit submitted successfully",
+      id: r.insertedId.toString(),
+      deposit: {
+        amount: numericAmount,
+        method: methodExists.name,
+        status: "pending"
+      }
+    });
 
   } catch (err) {
     console.error("Deposit error:", err);
@@ -483,7 +722,12 @@ app.post("/withdraw", auth, async (req, res) => {
       status: "pending",
       createdAt: new Date(),
     });
-    res.json({ message: "✅ Withdraw request submitted", id: r.insertedId.toString() });
+    
+    res.json({ 
+      success: true,
+      message: "✅ Withdraw request submitted successfully",
+      id: r.insertedId.toString()
+    });
 
   } catch (err) {
     console.error("Withdraw error:", err);
@@ -541,6 +785,7 @@ app.post("/invest", auth, async (req, res) => {
     const r = await investments.insertOne(investment);
 
     res.json({ 
+      success: true,
       message: "✅ Investment successful! Plan will run for 30 days.",
       id: r.insertedId.toString(),
       investment: {
@@ -577,7 +822,10 @@ app.get("/user/investments", auth, async (req, res) => {
       };
     });
 
-    res.json({ investments: investmentsWithDetails });
+    res.json({ 
+      success: true,
+      investments: investmentsWithDetails 
+    });
   } catch (err) {
     console.error("Error fetching investments:", err);
     res.status(500).json({ error: "Error fetching investments" });
@@ -590,7 +838,11 @@ app.post("/admin/login", (req, res) => {
   if (password !== ADMIN_SECRET) return res.status(401).json({ error: "Invalid password" });
 
   const token = jwt.sign({ id: "admin", isAdmin: true }, JWT_SECRET, { expiresIn: "7d" });
-  res.json({ token });
+  res.json({ 
+    success: true,
+    token,
+    message: "Admin login successful"
+  });
 });
 
 function requireAdmin(req, res, next) {
@@ -632,7 +884,7 @@ app.get("/admin/users", auth, requireAdmin, async (req, res) => {
 // --- Enhanced Deposit Approval ---
 app.get("/admin/deposits", auth, requireAdmin, async (req, res) => {
   try {
-    const depositsData = await deposits.find().toArray();
+    const depositsData = await deposits.find().sort({ createdAt: -1 }).toArray();
     
     // Get user info for each deposit
     const depositsWithUsers = await Promise.all(
@@ -689,6 +941,7 @@ app.post("/admin/deposit/:id/approve", auth, requireAdmin, async (req, res) => {
     );
 
     res.json({ 
+      success: true,
       message: "✅ Deposit approved successfully",
       depositId: deposit._id,
       amount: deposit.amount,
@@ -703,7 +956,7 @@ app.post("/admin/deposit/:id/approve", auth, requireAdmin, async (req, res) => {
 // --- Enhanced Withdrawal Approval ---
 app.get("/admin/withdrawals", auth, requireAdmin, async (req, res) => {
   try {
-    const withdrawalsData = await withdrawals.find().toArray();
+    const withdrawalsData = await withdrawals.find().sort({ createdAt: -1 }).toArray();
     
     // Get user info for each withdrawal
     const withdrawalsWithUsers = await Promise.all(
@@ -760,6 +1013,7 @@ app.post("/admin/withdraw/:id/approve", auth, requireAdmin, async (req, res) => 
     );
 
     res.json({ 
+      success: true,
       message: "✅ Withdrawal approved successfully",
       withdrawalId: withdrawal._id,
       amount: withdrawal.amount,
@@ -805,6 +1059,7 @@ app.get("/admin/stats", auth, requireAdmin, async (req, res) => {
     ]).toArray();
     
     res.json({
+      success: true,
       totalUsers,
       totalDeposits,
       totalWithdrawals,
