@@ -68,6 +68,77 @@ const upload = multer({ storage });
 app.use(express.static(path.join(__dirname, "public")));
 app.get("/", (_, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 
+// ====== PROFIT RATES ======
+const planRates = {
+  "STANDARD PLAN": 0.035,    // 3.50%
+  "PREMIUM PLAN": 0.045,     // 4.50%
+  "INVESTORS PLAN": 0.075,   // 7.50%
+  "CONFIDENT PLAN": 0.12,    // 12.00%
+};
+
+// ====== AUTO PROFIT & INVESTMENT COMPLETION HANDLER ======
+async function applyPendingProfits(userId) {
+  const activeInvestments = await investments.find({ userId, status: "active" }).toArray();
+  const now = new Date();
+
+  for (const inv of activeInvestments) {
+    // Check if investment has ended (30 days passed)
+    const investmentEnd = new Date(inv.endDate || inv.startDate);
+    investmentEnd.setDate(investmentEnd.getDate() + 30);
+    
+    if (now > investmentEnd && inv.status === "active") {
+      // Investment completed - return capital to user
+      await users.updateOne(
+        { _id: new ObjectId(inv.userId) },
+        { $inc: { balance: inv.amount } }
+      );
+      
+      // Mark investment as completed
+      await investments.updateOne(
+        { _id: inv._id },
+        { 
+          $set: { 
+            status: "completed",
+            capitalReturned: true,
+            completedAt: now
+          }
+        }
+      );
+      
+      console.log(`💰 Capital returned for investment ${inv._id} - $${inv.amount}`);
+      continue; // Skip profit calculation for completed investments
+    }
+
+    // Calculate daily profit if investment is still active
+    const last = new Date(inv.lastProfitAt || inv.startDate);
+    const hoursPassed = (now - last) / (1000 * 60 * 60);
+
+    if (hoursPassed >= 24) {
+      const rate = planRates[inv.plan] || 0.1;
+      const daysMissed = Math.floor(hoursPassed / 24);
+      const profit = inv.amount * rate * daysMissed;
+
+      // Add profit to user balance
+      await users.updateOne(
+        { _id: new ObjectId(inv.userId) },
+        { $inc: { balance: profit } }
+      );
+
+      // Update investment record
+      await investments.updateOne(
+        { _id: inv._id },
+        { 
+          $set: { lastProfitAt: now },
+          $inc: { 
+            daysCompleted: daysMissed,
+            totalProfitEarned: profit
+          }
+        }
+      );
+    }
+  }
+}
+
 // ====== USER AUTH ======
 app.post("/register", async (req, res) => {
   try {
@@ -322,47 +393,10 @@ app.post("/user/change-password", auth, async (req, res) => {
   }
 });
 
-// ====== PROFIT RATES ======
-const planRates = {
-  "STANDARD PLAN": 0.035,
-  "PREMIUM PLAN": 0.045,
-  "INVESTORS PLAN": 0.075,
-  "CONFIDENT PLAN": 0.12,
-};
-
-// ====== AUTO PROFIT HANDLER ======
-async function applyPendingProfits(userId) {
-  const activeInvestments = await investments.find({ userId, status: "active" }).toArray();
-
-  for (const inv of activeInvestments) {
-    const now = new Date();
-    const last = new Date(inv.lastProfitAt || inv.createdAt);
-    const hoursPassed = (now - last) / (1000 * 60 * 60);
-
-    if (hoursPassed >= 24) {
-      const rate = planRates[inv.plan] || 0.1; // fallback 10%
-      const daysMissed = Math.floor(hoursPassed / 24);
-      const profit = inv.amount * rate * daysMissed;
-
-      // Add profit to user balance
-      await users.updateOne(
-        { _id: new ObjectId(inv.userId) },
-        { $inc: { balance: profit } }
-      );
-
-      // Update lastProfitAt
-      await investments.updateOne(
-        { _id: inv._id },
-        { $set: { lastProfitAt: now } }
-      );
-    }
-  }
-}
-
 // ====== DASHBOARD ======
 app.get("/user/dashboard", auth, async (req, res) => {
   try {
-    // 🔥 Apply profits first
+    // 🔥 Apply profits first and check for completed investments
     await applyPendingProfits(req.userId);
 
     const user = await users.findOne(
@@ -378,8 +412,21 @@ app.get("/user/dashboard", auth, async (req, res) => {
     const userWithdrawals = await withdrawals.find({ userId: req.userId }).toArray();
     const userInvestments = await investments.find({ userId: req.userId }).toArray();
 
+    // Calculate active investments total
+    const activeInvestments = userInvestments.filter(inv => inv.status === "active");
+    const activeInvestTotal = activeInvestments.reduce((sum, inv) => sum + inv.amount, 0);
+    
+    // Update user's currentInvest field
+    await users.updateOne(
+      { _id: new ObjectId(req.userId) },
+      { $set: { currentInvest: activeInvestTotal } }
+    );
+
     res.json({ 
-      user, 
+      user: {
+        ...user,
+        currentInvest: activeInvestTotal
+      }, 
       deposits: userDeposits, 
       withdrawals: userWithdrawals, 
       investments: userInvestments 
@@ -444,7 +491,7 @@ app.post("/withdraw", auth, async (req, res) => {
   }
 });
 
-// ====== INVEST ======
+// ====== INVEST (UPDATED FOR 30-DAY SYSTEM) ======
 app.post("/invest", auth, async (req, res) => {
   try {
     const { amount, plan } = req.body;
@@ -453,31 +500,87 @@ app.post("/invest", auth, async (req, res) => {
       return res.status(400).json({ error: "Invalid fields" });
     }
 
+    // Validate plan exists
+    if (!planRates[plan]) {
+      return res.status(400).json({ error: "Invalid investment plan" });
+    }
+
     const user = await users.findOne({ _id: new ObjectId(req.userId) });
     if (!user) return res.status(404).json({ error: "User not found" });
     if (user.balance < numericAmount) return res.status(400).json({ error: "❌ Insufficient balance" });
 
-    // Deduct from balance & update currentInvest
-    await users.updateOne(
-      { _id: new ObjectId(req.userId) },
-      { $inc: { balance: -numericAmount, currentInvest: numericAmount } }
-    );
+    // Calculate end date (30 days from now)
+    const startDate = new Date();
+    const endDate = new Date();
+    endDate.setDate(endDate.getDate() + 30);
 
+    // Create investment record
     const investment = {
       userId: req.userId,
       amount: numericAmount,
       plan,
+      dailyRate: planRates[plan],
       status: "active",
+      startDate,
+      endDate,
+      totalDays: 30,
+      daysCompleted: 0,
+      totalProfitEarned: 0,
+      lastProfitAt: startDate,
+      capitalReturned: false,
       createdAt: new Date(),
-      lastProfitAt: new Date(), // 👈 important
     };
 
+    // Deduct from balance
+    await users.updateOne(
+      { _id: new ObjectId(req.userId) },
+      { $inc: { balance: -numericAmount } }
+    );
+
+    // Insert investment
     const r = await investments.insertOne(investment);
-    res.json({ message: "✅ Investment successful", id: r.insertedId.toString() });
+
+    res.json({ 
+      message: "✅ Investment successful! Plan will run for 30 days.",
+      id: r.insertedId.toString(),
+      investment: {
+        amount: numericAmount,
+        plan,
+        startDate,
+        endDate,
+        dailyRate: planRates[plan]
+      }
+    });
 
   } catch (err) {
     console.error("Invest error:", err);
     res.status(500).json({ error: "Investment error" });
+  }
+});
+
+// ====== GET USER INVESTMENTS ======
+app.get("/user/investments", auth, async (req, res) => {
+  try {
+    const userInvestments = await investments.find({ userId: req.userId }).toArray();
+    
+    // Calculate remaining days for each investment
+    const investmentsWithDetails = userInvestments.map(inv => {
+      const now = new Date();
+      const endDate = new Date(inv.endDate);
+      const remainingDays = Math.max(0, Math.ceil((endDate - now) / (1000 * 60 * 60 * 24)));
+      
+      return {
+        ...inv,
+        remainingDays,
+        isActive: inv.status === "active",
+        isCompleted: inv.status === "completed"
+      };
+    });
+
+    res.json({ investments: investmentsWithDetails });
+  } catch (err) {
+    console.error("Error fetching investments:", err);
+    res.status(500).json({ error: "Error fetching investments" });
   }
 });
 
@@ -495,7 +598,7 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// --- Admin Users Endpoint (FIXED - No mixed projections) ---
+// --- Admin Users Endpoint ---
 app.get("/admin/users", auth, requireAdmin, async (req, res) => {
   try {
     const allUsers = await users.find({}).toArray();
@@ -526,68 +629,7 @@ app.get("/admin/users", auth, requireAdmin, async (req, res) => {
   }
 });
 
-// --- Admin Get Single User (FIXED - No mixed projections) ---
-app.get("/admin/user/:id", auth, requireAdmin, async (req, res) => {
-  try {
-    const user = await users.findOne(
-      { _id: new ObjectId(req.params.id) }
-    );
-    
-    if (!user) return res.status(404).json({ error: "User not found" });
-    
-    // Remove password before sending
-    const { password, ...userWithoutPassword } = user;
-    res.json(userWithoutPassword);
-  } catch (err) {
-    console.error("Error fetching user:", err);
-    res.status(500).json({ error: "Error fetching user" });
-  }
-});
-
-// --- Enhanced Deposit Methods ---
-app.post("/admin/deposit-methods", auth, requireAdmin, upload.single("qr"), async (req, res) => {
-  try {
-    const { name, address } = req.body;
-    if (!name || !address || !req.file) return res.status(400).json({ error: "All fields required" });
-
-    const method = { name, address, qr: req.file.buffer.toString("base64"), createdAt: new Date() };
-    const r = await depositMethods.insertOne(method);
-    res.json({ message: "✅ Method added", id: r.insertedId.toString() });
-
-  } catch (err) {
-    console.error("Error adding method:", err);
-    res.status(500).json({ error: "Error adding method" });
-  }
-});
-
-app.get("/user/deposit-methods", async (_, res) => {
-  try {
-    const data = await depositMethods.find().toArray();
-    res.json(
-      data.map((m) => ({
-        _id: m._id,
-        name: m.name,
-        address: m.address,
-        qr: m.qr ? `data:image/png;base64,${m.qr}` : null,
-      }))
-    );
-  } catch (err) {
-    console.error("Error loading methods:", err);
-    res.status(500).json({ error: "Error loading methods" });
-  }
-});
-
-app.delete("/admin/deposit-methods/:id", auth, requireAdmin, async (req, res) => {
-  try {
-    await depositMethods.deleteOne({ _id: new ObjectId(req.params.id) });
-    res.json({ message: "✅ Method deleted" });
-  } catch (err) {
-    console.error("Error deleting method:", err);
-    res.status(500).json({ error: "Error deleting method" });
-  }
-});
-
-// --- Enhanced Deposit Approval with User Info (UPDATED) ---
+// --- Enhanced Deposit Approval ---
 app.get("/admin/deposits", auth, requireAdmin, async (req, res) => {
   try {
     const depositsData = await deposits.find().toArray();
@@ -658,7 +700,7 @@ app.post("/admin/deposit/:id/approve", auth, requireAdmin, async (req, res) => {
   }
 });
 
-// --- Enhanced Withdrawal Approval with User Info (UPDATED) ---
+// --- Enhanced Withdrawal Approval ---
 app.get("/admin/withdrawals", auth, requireAdmin, async (req, res) => {
   try {
     const withdrawalsData = await withdrawals.find().toArray();
@@ -729,7 +771,7 @@ app.post("/admin/withdraw/:id/approve", auth, requireAdmin, async (req, res) => 
   }
 });
 
-// --- Admin Dashboard Stats (NEW) ---
+// --- Admin Dashboard Stats ---
 app.get("/admin/stats", auth, requireAdmin, async (req, res) => {
   try {
     const totalUsers = await users.countDocuments();
@@ -739,6 +781,9 @@ app.get("/admin/stats", auth, requireAdmin, async (req, res) => {
     
     const pendingDeposits = await deposits.countDocuments({ status: "pending" });
     const pendingWithdrawals = await withdrawals.countDocuments({ status: "pending" });
+    
+    // Active investments count
+    const activeInvestments = await investments.countDocuments({ status: "active" });
     
     const totalDepositAmount = await deposits.aggregate([
       { $match: { status: "approved" } },
@@ -754,16 +799,23 @@ app.get("/admin/stats", auth, requireAdmin, async (req, res) => {
       { $group: { _id: null, total: { $sum: "$amount" } } }
     ]).toArray();
     
+    // Calculate total profit paid
+    const totalProfitPaid = await investments.aggregate([
+      { $group: { _id: null, total: { $sum: "$totalProfitEarned" } } }
+    ]).toArray();
+    
     res.json({
       totalUsers,
       totalDeposits,
       totalWithdrawals,
       totalInvestments,
+      activeInvestments,
       pendingDeposits,
       pendingWithdrawals,
       totalDepositAmount: totalDepositAmount[0]?.total || 0,
       totalWithdrawalAmount: totalWithdrawalAmount[0]?.total || 0,
       totalInvestmentAmount: totalInvestmentAmount[0]?.total || 0,
+      totalProfitPaid: totalProfitPaid[0]?.total || 0,
       updatedAt: new Date()
     });
   } catch (err) {
