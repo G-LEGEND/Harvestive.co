@@ -65,11 +65,6 @@ function auth(req, res, next) {
   }
 }
 
-function requireAdmin(req, res, next) {
-  if (!req.isAdmin) return res.status(403).json({ error: "Admin only" });
-  next();
-}
-
 // Multer
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
@@ -900,12 +895,6 @@ app.post("/withdraw", auth, async (req, res) => {
     // Insert withdrawal
     const r = await withdrawals.insertOne(withdrawal);
     
-    // Optionally, you can hold the funds immediately:
-    // await users.updateOne(
-    //   { _id: new ObjectId(req.userId) },
-    //   { $inc: { balance: -numericAmount } }
-    // );
-
     res.json({ 
       success: true,
       message: "✅ Withdraw request submitted successfully. Pending admin approval.",
@@ -1048,6 +1037,11 @@ app.post("/admin/login", (req, res) => {
     message: "Admin login successful"
   });
 });
+
+function requireAdmin(req, res, next) {
+  if (!req.isAdmin) return res.status(403).json({ error: "Admin only" });
+  next();
+}
 
 // --- Admin Users Endpoint ---
 app.get("/admin/users", auth, requireAdmin, async (req, res) => {
