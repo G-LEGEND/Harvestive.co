@@ -45,7 +45,55 @@ async function connectDB() {
     process.exit(1);
   }
 }
-connectDB();
+
+// ====== DATABASE MIGRATION ======
+async function migrateUserFields() {
+  try {
+    console.log("🔄 Checking for user migration...");
+    
+    // Count users without the new fields
+    const usersToMigrate = await users.countDocuments({
+      $or: [
+        { blocked: { $exists: false } },
+        { deleted: { $exists: false } }
+      ]
+    });
+    
+    if (usersToMigrate > 0) {
+      console.log(`🔄 Migrating ${usersToMigrate} users...`);
+      
+      // Add missing fields to all existing users
+      const updateResult = await users.updateMany(
+        { 
+          $or: [
+            { blocked: { $exists: false } },
+            { deleted: { $exists: false } },
+            { lastLogin: { $exists: false } }
+          ]
+        },
+        { 
+          $set: { 
+            blocked: false,
+            deleted: false,
+            lastLogin: null
+          }
+        }
+      );
+      
+      console.log(`✅ Successfully migrated ${updateResult.modifiedCount} users`);
+    } else {
+      console.log("✅ All users already have the new fields");
+    }
+    
+  } catch (err) {
+    console.error("❌ Migration error:", err);
+  }
+}
+
+// Initialize database and run migration
+connectDB().then(() => {
+  setTimeout(migrateUserFields, 1000); // Run after 1 second
+});
 
 // ====== Middleware ======
 function auth(req, res, next) {
@@ -259,13 +307,13 @@ app.post("/login", async (req, res) => {
     const user = await users.findOne({ email });
     if (!user) return res.status(404).json({ error: "User not found" });
     
-    // Check if user is blocked
-    if (user.blocked) {
+    // Check if user is blocked (backward compatible)
+    if (user.blocked === true) {
       return res.status(403).json({ error: "This account has been blocked. Contact support." });
     }
     
-    // Check if user is deleted
-    if (user.deleted) {
+    // Check if user is deleted (backward compatible)
+    if (user.deleted === true) {
       return res.status(403).json({ error: "This account has been deleted." });
     }
     
@@ -307,13 +355,19 @@ app.post("/login", async (req, res) => {
 // ====== USER PROFILE ENDPOINTS ======
 app.get("/user/profile", auth, async (req, res) => {
   try {
-    const user = await users.findOne(
-      { _id: new ObjectId(req.userId), deleted: false }
-    );
+    const user = await users.findOne({ 
+      _id: new ObjectId(req.userId)
+    });
     
     if (!user) return res.status(404).json({ error: "User not found" });
     
-    if (user.blocked) {
+    // Backward compatible check for deleted users
+    if (user.deleted === true) {
+      return res.status(403).json({ error: "Your account has been deleted." });
+    }
+    
+    // Backward compatible check for blocked users
+    if (user.blocked === true) {
       return res.status(403).json({ error: "Your account has been blocked. Contact support." });
     }
 
@@ -337,14 +391,18 @@ app.put("/user/profile", auth, async (req, res) => {
   try {
     const { firstName, lastName, phone, country, address } = req.body;
     
-    // Check if user exists and not blocked
+    // Check if user exists (backward compatible)
     const user = await users.findOne({ 
-      _id: new ObjectId(req.userId),
-      deleted: false 
+      _id: new ObjectId(req.userId)
     });
     
     if (!user) return res.status(404).json({ error: "User not found" });
-    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
+    
+    // Backward compatible check for deleted users
+    if (user.deleted === true) return res.status(403).json({ error: "Account deleted" });
+    
+    // Backward compatible check for blocked users
+    if (user.blocked === true) return res.status(403).json({ error: "Account blocked" });
     
     // Build update object
     const updateFields = {};
@@ -414,13 +472,17 @@ app.post("/user/change-password", auth, async (req, res) => {
       return res.status(400).json({ error: "New password must be at least 6 characters" });
     }
     
-    // Get user
+    // Get user (backward compatible)
     const user = await users.findOne({ 
-      _id: new ObjectId(req.userId),
-      deleted: false 
+      _id: new ObjectId(req.userId)
     });
     if (!user) return res.status(404).json({ error: "User not found" });
-    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
+    
+    // Backward compatible check for deleted users
+    if (user.deleted === true) return res.status(403).json({ error: "Account deleted" });
+    
+    // Backward compatible check for blocked users
+    if (user.blocked === true) return res.status(403).json({ error: "Account blocked" });
     
     // Verify current password
     const isValid = await bcrypt.compare(currentPassword, user.password);
@@ -446,14 +508,18 @@ app.post("/user/change-password", auth, async (req, res) => {
 // ====== DASHBOARD ======
 app.get("/user/dashboard", auth, async (req, res) => {
   try {
-    // Check if user exists and not blocked/deleted
+    // Check if user exists (backward compatible)
     const user = await users.findOne({ 
-      _id: new ObjectId(req.userId),
-      deleted: false 
+      _id: new ObjectId(req.userId)
     });
     
     if (!user) return res.status(404).json({ error: "User not found" });
-    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
+    
+    // Backward compatible check for deleted users
+    if (user.deleted === true) return res.status(403).json({ error: "Account deleted" });
+    
+    // Backward compatible check for blocked users
+    if (user.blocked === true) return res.status(403).json({ error: "Account blocked" });
     
     // 🔥 Apply profits first and check for completed investments
     await applyPendingProfits(req.userId);
@@ -816,13 +882,17 @@ app.post("/deposit", auth, upload.single("screenshot"), async (req, res) => {
       return res.status(400).json({ error: "Invalid deposit method" });
     }
 
-    // Check if user exists and not blocked
+    // Check if user exists (backward compatible)
     const user = await users.findOne({ 
-      _id: new ObjectId(req.userId),
-      deleted: false 
+      _id: new ObjectId(req.userId)
     });
     if (!user) return res.status(404).json({ error: "User not found" });
-    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
+    
+    // Backward compatible check for deleted users
+    if (user.deleted === true) return res.status(403).json({ error: "Account deleted" });
+    
+    // Backward compatible check for blocked users
+    if (user.blocked === true) return res.status(403).json({ error: "Account blocked" });
 
     const deposit = {
       userId: req.userId,
@@ -868,14 +938,18 @@ app.post("/withdraw", auth, async (req, res) => {
       return res.status(400).json({ error: "❌ Minimum withdrawal is $20,000" });
     }
 
-    // Check if user exists and not blocked
+    // Check if user exists (backward compatible)
     const user = await users.findOne({ 
-      _id: new ObjectId(req.userId),
-      deleted: false 
+      _id: new ObjectId(req.userId)
     });
     
     if (!user) return res.status(404).json({ error: "User not found" });
-    if (user.blocked) return res.status(403).json({ error: "Account blocked. Contact support." });
+    
+    // Backward compatible check for deleted users
+    if (user.deleted === true) return res.status(403).json({ error: "Account deleted. Contact support." });
+    
+    // Backward compatible check for blocked users
+    if (user.blocked === true) return res.status(403).json({ error: "Account blocked. Contact support." });
 
     // Check sufficient balance
     if (user.balance < numericAmount) {
@@ -927,14 +1001,19 @@ app.post("/invest", auth, async (req, res) => {
       return res.status(400).json({ error: "Invalid investment plan" });
     }
 
-    // Check if user exists and not blocked
+    // Check if user exists (backward compatible)
     const user = await users.findOne({ 
-      _id: new ObjectId(req.userId),
-      deleted: false 
+      _id: new ObjectId(req.userId)
     });
     
     if (!user) return res.status(404).json({ error: "User not found" });
-    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
+    
+    // Backward compatible check for deleted users
+    if (user.deleted === true) return res.status(403).json({ error: "Account deleted" });
+    
+    // Backward compatible check for blocked users
+    if (user.blocked === true) return res.status(403).json({ error: "Account blocked" });
+    
     if (user.balance < numericAmount) return res.status(400).json({ error: "❌ Insufficient balance" });
 
     // Calculate end date (30 days from now)
@@ -990,14 +1069,18 @@ app.post("/invest", auth, async (req, res) => {
 // ====== GET USER INVESTMENTS ======
 app.get("/user/investments", auth, async (req, res) => {
   try {
-    // Check if user exists and not blocked
+    // Check if user exists (backward compatible)
     const user = await users.findOne({ 
-      _id: new ObjectId(req.userId),
-      deleted: false 
+      _id: new ObjectId(req.userId)
     });
     
     if (!user) return res.status(404).json({ error: "User not found" });
-    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
+    
+    // Backward compatible check for deleted users
+    if (user.deleted === true) return res.status(403).json({ error: "Account deleted" });
+    
+    // Backward compatible check for blocked users
+    if (user.blocked === true) return res.status(403).json({ error: "Account blocked" });
 
     const userInvestments = await investments.find({ userId: req.userId }).toArray();
     
@@ -1209,9 +1292,9 @@ app.post("/admin/deposit/:id/approve", auth, requireAdmin, async (req, res) => {
     const deposit = await deposits.findOne({ _id: new ObjectId(req.params.id) });
     if (!deposit || deposit.status !== "pending") return res.status(400).json({ error: "Not pending" });
 
-    // Check if user is blocked
+    // Check if user is blocked (backward compatible)
     const user = await users.findOne({ _id: new ObjectId(deposit.userId) });
-    if (user && user.blocked) {
+    if (user && user.blocked === true) {
       return res.status(400).json({ error: "Cannot approve deposit for blocked user" });
     }
 
@@ -1290,14 +1373,14 @@ app.post("/admin/withdraw/:id/approve", auth, requireAdmin, async (req, res) => 
     const withdrawal = await withdrawals.findOne({ _id: new ObjectId(req.params.id) });
     if (!withdrawal || withdrawal.status !== "pending") return res.status(400).json({ error: "Not pending" });
 
-    // Check if user is blocked
+    // Check if user is blocked (backward compatible)
     const user = await users.findOne({ _id: new ObjectId(withdrawal.userId) });
-    if (user && user.blocked) {
+    if (user && user.blocked === true) {
       return res.status(400).json({ error: "Cannot approve withdrawal for blocked user" });
     }
 
     // Check if user has sufficient balance
-    if (user.balance < withdrawal.amount) {
+    if (user && user.balance < withdrawal.amount) {
       return res.status(400).json({ error: "User has insufficient balance" });
     }
 
@@ -1323,7 +1406,10 @@ app.post("/admin/withdraw/:id/approve", auth, requireAdmin, async (req, res) => 
 // --- Admin Dashboard Stats ---
 app.get("/admin/stats", auth, requireAdmin, async (req, res) => {
   try {
-    const totalUsers = await users.countDocuments({ deleted: false });
+    // Count users (backward compatible - count all users except those with deleted: true)
+    const allUsers = await users.find({}).toArray();
+    const totalUsers = allUsers.filter(user => user.deleted !== true).length;
+    
     const totalDeposits = await deposits.countDocuments();
     const totalWithdrawals = await withdrawals.countDocuments();
     const totalInvestments = await investments.countDocuments();
@@ -1334,8 +1420,8 @@ app.get("/admin/stats", auth, requireAdmin, async (req, res) => {
     // Active investments count
     const activeInvestments = await investments.countDocuments({ status: "active" });
     
-    // Blocked users count
-    const blockedUsers = await users.countDocuments({ blocked: true, deleted: false });
+    // Blocked users count (backward compatible)
+    const blockedUsers = allUsers.filter(user => user.blocked === true && user.deleted !== true).length;
     
     const totalDepositAmount = await deposits.aggregate([
       { $match: { status: "approved" } },
