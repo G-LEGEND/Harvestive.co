@@ -65,6 +65,11 @@ function auth(req, res, next) {
   }
 }
 
+function requireAdmin(req, res, next) {
+  if (!req.isAdmin) return res.status(403).json({ error: "Admin only" });
+  next();
+}
+
 // Multer
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
@@ -192,6 +197,12 @@ app.post("/register", async (req, res) => {
       return res.status(400).json({ error: "Email already registered" });
     }
 
+    // Check if user is blocked
+    const blockedUser = await users.findOne({ email, blocked: true });
+    if (blockedUser) {
+      return res.status(400).json({ error: "This account has been blocked" });
+    }
+
     // Generate username from email if not provided
     const finalUsername = username || email.split("@")[0];
 
@@ -212,6 +223,9 @@ app.post("/register", async (req, res) => {
       currentInvest: 0,
       createdAt: new Date(),
       displayName: `${firstName} ${lastName}`,
+      blocked: false,
+      deleted: false,
+      lastLogin: null,
       profile: {
         phone: "",
         country: "",
@@ -249,7 +263,26 @@ app.post("/login", async (req, res) => {
     const { email, password } = req.body;
     const user = await users.findOne({ email });
     if (!user) return res.status(404).json({ error: "User not found" });
-    if (!(await bcrypt.compare(password, user.password))) return res.status(400).json({ error: "Invalid password" });
+    
+    // Check if user is blocked
+    if (user.blocked) {
+      return res.status(403).json({ error: "This account has been blocked. Contact support." });
+    }
+    
+    // Check if user is deleted
+    if (user.deleted) {
+      return res.status(403).json({ error: "This account has been deleted." });
+    }
+    
+    if (!(await bcrypt.compare(password, user.password))) {
+      return res.status(400).json({ error: "Invalid password" });
+    }
+
+    // Update last login
+    await users.updateOne(
+      { _id: user._id },
+      { $set: { lastLogin: new Date() } }
+    );
 
     const token = jwt.sign({ 
       id: user._id.toString(), 
@@ -280,10 +313,14 @@ app.post("/login", async (req, res) => {
 app.get("/user/profile", auth, async (req, res) => {
   try {
     const user = await users.findOne(
-      { _id: new ObjectId(req.userId) }
+      { _id: new ObjectId(req.userId), deleted: false }
     );
     
     if (!user) return res.status(404).json({ error: "User not found" });
+    
+    if (user.blocked) {
+      return res.status(403).json({ error: "Your account has been blocked. Contact support." });
+    }
 
     // Remove password before sending
     delete user.password;
@@ -304,6 +341,15 @@ app.get("/user/profile", auth, async (req, res) => {
 app.put("/user/profile", auth, async (req, res) => {
   try {
     const { firstName, lastName, phone, country, address } = req.body;
+    
+    // Check if user exists and not blocked
+    const user = await users.findOne({ 
+      _id: new ObjectId(req.userId),
+      deleted: false 
+    });
+    
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
     
     // Build update object
     const updateFields = {};
@@ -374,8 +420,12 @@ app.post("/user/change-password", auth, async (req, res) => {
     }
     
     // Get user
-    const user = await users.findOne({ _id: new ObjectId(req.userId) });
+    const user = await users.findOne({ 
+      _id: new ObjectId(req.userId),
+      deleted: false 
+    });
     if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
     
     // Verify current password
     const isValid = await bcrypt.compare(currentPassword, user.password);
@@ -401,14 +451,17 @@ app.post("/user/change-password", auth, async (req, res) => {
 // ====== DASHBOARD ======
 app.get("/user/dashboard", auth, async (req, res) => {
   try {
-    // 🔥 Apply profits first and check for completed investments
-    await applyPendingProfits(req.userId);
-
-    const user = await users.findOne(
-      { _id: new ObjectId(req.userId) }
-    );
+    // Check if user exists and not blocked/deleted
+    const user = await users.findOne({ 
+      _id: new ObjectId(req.userId),
+      deleted: false 
+    });
     
     if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
+    
+    // 🔥 Apply profits first and check for completed investments
+    await applyPendingProfits(req.userId);
 
     // Remove password before sending
     delete user.password;
@@ -647,6 +700,102 @@ app.get("/user/withdraw-methods", async (req, res) => {
   }
 });
 
+// ADMIN: GET all withdraw methods
+app.get("/admin/withdraw-methods", auth, requireAdmin, async (req, res) => {
+  try {
+    const methods = await withdrawMethods.find().sort({ createdAt: -1 }).toArray();
+    res.json(methods);
+  } catch (err) {
+    console.error("Error fetching withdraw methods:", err);
+    res.status(500).json({ error: "Error fetching withdraw methods" });
+  }
+});
+
+// ADMIN: ADD new withdraw method
+app.post("/admin/withdraw-methods", auth, requireAdmin, async (req, res) => {
+  try {
+    const { name, min, fee } = req.body;
+    
+    if (!name || !min || fee === undefined) {
+      return res.status(400).json({ error: "Name, minimum amount and fee are required" });
+    }
+
+    const method = {
+      name,
+      min: parseFloat(min),
+      fee: parseFloat(fee),
+      enabled: true,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const result = await withdrawMethods.insertOne(method);
+    
+    res.json({ 
+      success: true,
+      message: "✅ Withdraw method added successfully",
+      methodId: result.insertedId,
+      method: method
+    });
+
+  } catch (err) {
+    console.error("Error adding withdraw method:", err);
+    res.status(500).json({ error: "Error adding withdraw method" });
+  }
+});
+
+// ADMIN: DELETE withdraw method
+app.delete("/admin/withdraw-methods/:id", auth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const result = await withdrawMethods.deleteOne({ _id: new ObjectId(id) });
+    
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ error: "Method not found" });
+    }
+    
+    res.json({ 
+      success: true,
+      message: "✅ Withdraw method deleted successfully",
+      deletedId: id
+    });
+
+  } catch (err) {
+    console.error("Error deleting withdraw method:", err);
+    res.status(500).json({ error: "Error deleting withdraw method" });
+  }
+});
+
+// ADMIN: TOGGLE withdraw method status
+app.put("/admin/withdraw-methods/:id/toggle", auth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const method = await withdrawMethods.findOne({ _id: new ObjectId(id) });
+    
+    if (!method) {
+      return res.status(404).json({ error: "Method not found" });
+    }
+    
+    const newStatus = !method.enabled;
+    await withdrawMethods.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { enabled: newStatus, updatedAt: new Date() } }
+    );
+    
+    res.json({ 
+      success: true,
+      message: `✅ Method ${newStatus ? 'enabled' : 'disabled'} successfully`,
+      methodId: id,
+      enabled: newStatus
+    });
+
+  } catch (err) {
+    console.error("Error toggling withdraw method:", err);
+    res.status(500).json({ error: "Error toggling withdraw method" });
+  }
+});
+
 // ====== DEPOSIT ======
 app.post("/deposit", auth, upload.single("screenshot"), async (req, res) => {
   try {
@@ -671,6 +820,14 @@ app.post("/deposit", auth, upload.single("screenshot"), async (req, res) => {
     if (!methodExists) {
       return res.status(400).json({ error: "Invalid deposit method" });
     }
+
+    // Check if user exists and not blocked
+    const user = await users.findOne({ 
+      _id: new ObjectId(req.userId),
+      deleted: false 
+    });
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
 
     const deposit = {
       userId: req.userId,
@@ -707,31 +864,63 @@ app.post("/withdraw", auth, async (req, res) => {
   try {
     const { amount, method, address } = req.body;
     const numericAmount = parseFloat(amount);
-    if (!amount || !method || !address || isNaN(numericAmount))
-      return res.status(400).json({ error: "Invalid request" });
-    if (numericAmount < 20000) return res.status(400).json({ error: "❌ Minimum withdrawal is 20,000" });
+    
+    if (!amount || !method || !address || isNaN(numericAmount)) {
+      return res.status(400).json({ error: "Invalid request. All fields are required." });
+    }
+    
+    if (numericAmount < 20000) {
+      return res.status(400).json({ error: "❌ Minimum withdrawal is $20,000" });
+    }
 
-    const user = await users.findOne({ _id: new ObjectId(req.userId) });
-    if (!user || user.balance < numericAmount) return res.status(400).json({ error: "❌ Insufficient balance" });
+    // Check if user exists and not blocked
+    const user = await users.findOne({ 
+      _id: new ObjectId(req.userId),
+      deleted: false 
+    });
+    
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.blocked) return res.status(403).json({ error: "Account blocked. Contact support." });
 
-    const r = await withdrawals.insertOne({
+    // Check sufficient balance
+    if (user.balance < numericAmount) {
+      return res.status(400).json({ error: "❌ Insufficient balance" });
+    }
+
+    // Create withdrawal record
+    const withdrawal = {
       userId: req.userId,
       amount: numericAmount,
       method,
       address,
       status: "pending",
       createdAt: new Date(),
-    });
+    };
+
+    // Insert withdrawal
+    const r = await withdrawals.insertOne(withdrawal);
     
+    // Optionally, you can hold the funds immediately:
+    // await users.updateOne(
+    //   { _id: new ObjectId(req.userId) },
+    //   { $inc: { balance: -numericAmount } }
+    // );
+
     res.json({ 
       success: true,
-      message: "✅ Withdraw request submitted successfully",
-      id: r.insertedId.toString()
+      message: "✅ Withdraw request submitted successfully. Pending admin approval.",
+      id: r.insertedId.toString(),
+      withdrawal: {
+        amount: numericAmount,
+        method,
+        address,
+        status: "pending"
+      }
     });
 
   } catch (err) {
     console.error("Withdraw error:", err);
-    res.status(500).json({ error: "Withdraw error" });
+    res.status(500).json({ error: "Withdraw error: " + err.message });
   }
 });
 
@@ -749,8 +938,14 @@ app.post("/invest", auth, async (req, res) => {
       return res.status(400).json({ error: "Invalid investment plan" });
     }
 
-    const user = await users.findOne({ _id: new ObjectId(req.userId) });
+    // Check if user exists and not blocked
+    const user = await users.findOne({ 
+      _id: new ObjectId(req.userId),
+      deleted: false 
+    });
+    
     if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
     if (user.balance < numericAmount) return res.status(400).json({ error: "❌ Insufficient balance" });
 
     // Calculate end date (30 days from now)
@@ -806,6 +1001,15 @@ app.post("/invest", auth, async (req, res) => {
 // ====== GET USER INVESTMENTS ======
 app.get("/user/investments", auth, async (req, res) => {
   try {
+    // Check if user exists and not blocked
+    const user = await users.findOne({ 
+      _id: new ObjectId(req.userId),
+      deleted: false 
+    });
+    
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (user.blocked) return res.status(403).json({ error: "Account blocked" });
+
     const userInvestments = await investments.find({ userId: req.userId }).toArray();
     
     // Calculate remaining days for each investment
@@ -845,11 +1049,6 @@ app.post("/admin/login", (req, res) => {
   });
 });
 
-function requireAdmin(req, res, next) {
-  if (!req.isAdmin) return res.status(403).json({ error: "Admin only" });
-  next();
-}
-
 // --- Admin Users Endpoint ---
 app.get("/admin/users", auth, requireAdmin, async (req, res) => {
   try {
@@ -865,11 +1064,14 @@ app.get("/admin/users", auth, requireAdmin, async (req, res) => {
         email: user.email || '',
         username: user.username || '',
         createdAt: user.createdAt,
+        lastLogin: user.lastLogin,
         balance: user.balance || 0,
         totalDeposit: user.totalDeposit || 0,
         totalWithdraw: user.totalWithdraw || 0,
         currentInvest: user.currentInvest || 0,
         displayName: user.displayName || '',
+        blocked: user.blocked || false,
+        deleted: user.deleted || false,
         profile: user.profile || {}
       };
     });
@@ -878,6 +1080,82 @@ app.get("/admin/users", auth, requireAdmin, async (req, res) => {
   } catch (err) {
     console.error("Error fetching users:", err);
     res.status(500).json({ error: "Error fetching users" });
+  }
+});
+
+// --- DELETE USER PERMANENTLY ---
+app.delete("/admin/users/:id", auth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Start a session for transaction-like behavior
+    const session = client.startSession();
+    
+    try {
+      await session.withTransaction(async () => {
+        // 1. Delete user's deposits
+        await deposits.deleteMany({ userId: id }, { session });
+        
+        // 2. Delete user's withdrawals
+        await withdrawals.deleteMany({ userId: id }, { session });
+        
+        // 3. Delete user's investments
+        await investments.deleteMany({ userId: id }, { session });
+        
+        // 4. Finally delete the user
+        const result = await users.deleteOne({ _id: new ObjectId(id) }, { session });
+        
+        if (result.deletedCount === 0) {
+          throw new Error("User not found");
+        }
+      });
+      
+      res.json({ 
+        success: true,
+        message: "✅ User and all associated data deleted permanently",
+        deletedId: id
+      });
+      
+    } finally {
+      await session.endSession();
+    }
+    
+  } catch (err) {
+    console.error("Error deleting user:", err);
+    res.status(500).json({ error: "Error deleting user: " + err.message });
+  }
+});
+
+// --- BLOCK/UNBLOCK USER ---
+app.put("/admin/users/:id/block", auth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { blocked } = req.body;
+    
+    if (typeof blocked !== 'boolean') {
+      return res.status(400).json({ error: "Blocked status must be boolean" });
+    }
+    
+    const user = await users.findOne({ _id: new ObjectId(id) });
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    await users.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { blocked: blocked } }
+    );
+    
+    res.json({ 
+      success: true,
+      message: `✅ User ${blocked ? 'blocked' : 'unblocked'} successfully`,
+      userId: id,
+      blocked: blocked
+    });
+    
+  } catch (err) {
+    console.error("Error blocking user:", err);
+    res.status(500).json({ error: "Error blocking user" });
   }
 });
 
@@ -900,12 +1178,14 @@ app.get("/admin/deposits", auth, requireAdmin, async (req, res) => {
               fullName: `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.username || "Unknown",
               email: user.email || "N/A",
               username: user.username || "N/A",
-              displayName: user.displayName || "N/A"
+              displayName: user.displayName || "N/A",
+              blocked: user.blocked || false
             } : {
               fullName: "Unknown User",
               email: "N/A",
               username: "N/A",
-              displayName: "N/A"
+              displayName: "N/A",
+              blocked: false
             }
           };
         } catch (err) {
@@ -915,7 +1195,8 @@ app.get("/admin/deposits", auth, requireAdmin, async (req, res) => {
               fullName: "Error loading user",
               email: "N/A",
               username: "N/A",
-              displayName: "N/A"
+              displayName: "N/A",
+              blocked: false
             }
           };
         }
@@ -933,6 +1214,12 @@ app.post("/admin/deposit/:id/approve", auth, requireAdmin, async (req, res) => {
   try {
     const deposit = await deposits.findOne({ _id: new ObjectId(req.params.id) });
     if (!deposit || deposit.status !== "pending") return res.status(400).json({ error: "Not pending" });
+
+    // Check if user is blocked
+    const user = await users.findOne({ _id: new ObjectId(deposit.userId) });
+    if (user && user.blocked) {
+      return res.status(400).json({ error: "Cannot approve deposit for blocked user" });
+    }
 
     await deposits.updateOne({ _id: deposit._id }, { $set: { status: "approved", approvedAt: new Date() } });
     await users.updateOne(
@@ -972,12 +1259,14 @@ app.get("/admin/withdrawals", auth, requireAdmin, async (req, res) => {
               fullName: `${user.firstName || ''} ${user.lastName || ''}`.trim() || user.username || "Unknown",
               email: user.email || "N/A",
               username: user.username || "N/A",
-              displayName: user.displayName || "N/A"
+              displayName: user.displayName || "N/A",
+              blocked: user.blocked || false
             } : {
               fullName: "Unknown User",
               email: "N/A",
               username: "N/A",
-              displayName: "N/A"
+              displayName: "N/A",
+              blocked: false
             }
           };
         } catch (err) {
@@ -987,7 +1276,8 @@ app.get("/admin/withdrawals", auth, requireAdmin, async (req, res) => {
               fullName: "Error loading user",
               email: "N/A",
               username: "N/A",
-              displayName: "N/A"
+              displayName: "N/A",
+              blocked: false
             }
           };
         }
@@ -1005,6 +1295,17 @@ app.post("/admin/withdraw/:id/approve", auth, requireAdmin, async (req, res) => 
   try {
     const withdrawal = await withdrawals.findOne({ _id: new ObjectId(req.params.id) });
     if (!withdrawal || withdrawal.status !== "pending") return res.status(400).json({ error: "Not pending" });
+
+    // Check if user is blocked
+    const user = await users.findOne({ _id: new ObjectId(withdrawal.userId) });
+    if (user && user.blocked) {
+      return res.status(400).json({ error: "Cannot approve withdrawal for blocked user" });
+    }
+
+    // Check if user has sufficient balance
+    if (user.balance < withdrawal.amount) {
+      return res.status(400).json({ error: "User has insufficient balance" });
+    }
 
     await withdrawals.updateOne({ _id: withdrawal._id }, { $set: { status: "approved", approvedAt: new Date() } });
     await users.updateOne(
@@ -1028,7 +1329,7 @@ app.post("/admin/withdraw/:id/approve", auth, requireAdmin, async (req, res) => 
 // --- Admin Dashboard Stats ---
 app.get("/admin/stats", auth, requireAdmin, async (req, res) => {
   try {
-    const totalUsers = await users.countDocuments();
+    const totalUsers = await users.countDocuments({ deleted: false });
     const totalDeposits = await deposits.countDocuments();
     const totalWithdrawals = await withdrawals.countDocuments();
     const totalInvestments = await investments.countDocuments();
@@ -1038,6 +1339,9 @@ app.get("/admin/stats", auth, requireAdmin, async (req, res) => {
     
     // Active investments count
     const activeInvestments = await investments.countDocuments({ status: "active" });
+    
+    // Blocked users count
+    const blockedUsers = await users.countDocuments({ blocked: true, deleted: false });
     
     const totalDepositAmount = await deposits.aggregate([
       { $match: { status: "approved" } },
@@ -1065,6 +1369,7 @@ app.get("/admin/stats", auth, requireAdmin, async (req, res) => {
       totalWithdrawals,
       totalInvestments,
       activeInvestments,
+      blockedUsers,
       pendingDeposits,
       pendingWithdrawals,
       totalDepositAmount: totalDepositAmount[0]?.total || 0,
@@ -1080,4 +1385,4 @@ app.get("/admin/stats", auth, requireAdmin, async (req, res) => {
 });
 
 // ====== START ======
-app.listen(PORT, () => console.log(`🚀 Running http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
